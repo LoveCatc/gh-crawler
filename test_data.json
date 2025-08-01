@@ -1,0 +1,39 @@
+{
+  "language": "Python",
+  "summary": {
+    "total_repositories": 5,
+    "total_stars": 500000,
+    "average_stars": 100000,
+    "top_repository": {
+      "url": "https://github.com/python/cpython",
+      "stars": 200000
+    }
+  },
+  "repositories": [
+    {
+      "url": "https://github.com/python/cpython",
+      "stars": 200000,
+      "language": ["Python", "C"]
+    },
+    {
+      "url": "https://github.com/pallets/flask",
+      "stars": 65000,
+      "language": ["Python"]
+    },
+    {
+      "url": "https://github.com/django/django",
+      "stars": 75000,
+      "language": ["Python"]
+    },
+    {
+      "url": "https://github.com/psf/requests",
+      "stars": 50000,
+      "language": ["Python"]
+    },
+    {
+      "url": "https://github.com/numpy/numpy",
+      "stars": 25000,
+      "language": ["Python", "C"]
+    }
+  ]
+}
