@@ -54,26 +54,47 @@ class InputHandler:
 
 class OutputHandler:
     """Handler for writing output JSONL files."""
-    
+
     @staticmethod
-    def save_crawled_repositories(repositories: List[CrawledRepository], output_path: str) -> bool:
-        """Save crawled repositories to JSONL file."""
+    def save_crawled_repositories(repositories: List[CrawledRepository], output_path: str, append: bool = True) -> bool:
+        """Save crawled repositories to JSONL file.
+
+        Args:
+            repositories: List of crawled repositories to save
+            output_path: Path to output file
+            append: If True, append to existing file; if False, overwrite
+
+        Returns:
+            True if save was successful, False otherwise
+        """
+        if not repositories:
+            logger.info("No repositories to save")
+            return True
+
         try:
             logger.info(f"Saving {len(repositories)} repositories to: {output_path}")
-            
+
             path = Path(output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(path, 'w', encoding='utf-8') as f:
+
+            # Check if file exists and we're appending
+            mode = 'a' if append and path.exists() else 'w'
+
+            if mode == 'a' and path.exists():
+                logger.info(f"Appending to existing file: {output_path}")
+            else:
+                logger.info(f"Creating new file: {output_path}")
+
+            with open(path, mode, encoding='utf-8') as f:
                 for repo in repositories:
                     # Convert to dict and write as JSON line
                     repo_dict = repo.to_dict()
                     json_line = json.dumps(repo_dict, ensure_ascii=False)
                     f.write(json_line + '\n')
-            
+
             logger.info(f"Successfully saved repositories to {output_path}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error saving repositories to {output_path}: {e}")
             return False
@@ -114,21 +135,75 @@ class OutputHandler:
     
     @staticmethod
     def append_crawled_repository(repository: CrawledRepository, output_path: str) -> bool:
-        """Append a single crawled repository to JSONL file."""
+        """Append a single crawled repository to JSONL file.
+
+        This method is designed for immediate writing after each repository is crawled
+        to prevent data loss in case of interruption.
+
+        Args:
+            repository: The crawled repository to append
+            output_path: Path to the output JSONL file
+
+        Returns:
+            True if the repository was successfully written, False otherwise
+        """
         try:
             path = Path(output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            
+
+            # Convert to dict and create JSON line
+            repo_dict = repository.to_dict()
+            json_line = json.dumps(repo_dict, ensure_ascii=False)
+
+            # Write atomically by opening, writing, and closing immediately
+            # This ensures the data is flushed to disk right away
             with open(path, 'a', encoding='utf-8') as f:
-                repo_dict = repository.to_dict()
-                json_line = json.dumps(repo_dict, ensure_ascii=False)
                 f.write(json_line + '\n')
-            
+                f.flush()  # Ensure data is written to disk immediately
+
+            logger.debug(f"Successfully wrote repository {repository.url} to {output_path}")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Error appending repository to {output_path}: {e}")
+            logger.error(f"Error appending repository {repository.url} to {output_path}: {e}")
             return False
+
+    @staticmethod
+    def get_existing_repository_urls(output_path: str) -> set:
+        """Get set of repository URLs that already exist in the output file.
+
+        Args:
+            output_path: Path to the output JSONL file
+
+        Returns:
+            Set of repository URLs found in the file
+        """
+        existing_urls = set()
+        path = Path(output_path)
+
+        if not path.exists():
+            return existing_urls
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        repo_data = json.loads(line)
+                        if 'url' in repo_data:
+                            existing_urls.add(repo_data['url'])
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Invalid JSON on line {line_num} in {output_path}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Error parsing line {line_num} in {output_path}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error reading output file {output_path}: {e}")
+
+        return existing_urls
 
 
 class FileManager:

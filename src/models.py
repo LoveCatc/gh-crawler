@@ -35,14 +35,41 @@ class InputData:
 
 @dataclass_json
 @dataclass
+class Comment:
+    """Represents a comment in a PR or issue."""
+    author: str
+    timestamp: str  # ISO format timestamp
+    content: str
+
+
+@dataclass_json
+@dataclass
+class IssueInfo:
+    """Detailed information about an issue."""
+    number: int
+    title: str
+    state: str  # open, closed
+    author: str  # User who opened the issue
+    created_at: str  # ISO format timestamp
+    updated_at: str  # ISO format timestamp
+    tags: List[str] = field(default_factory=list)
+    comments: List[Comment] = field(default_factory=list)
+    url: str = ""
+
+
+@dataclass_json
+@dataclass
 class PullRequestInfo:
     """Detailed information about a pull request."""
     number: int
     title: str
     state: str  # open, closed, merged
+    author: str  # User who opened the PR
+    created_at: str  # ISO format timestamp
+    updated_at: str  # ISO format timestamp
     tags: List[str] = field(default_factory=list)
-    comments: List[str] = field(default_factory=list)
-    related_issues: List[int] = field(default_factory=list)
+    comments: List[Comment] = field(default_factory=list)
+    related_issues: List[IssueInfo] = field(default_factory=list)  # Full issue content
     url: str = ""
 
 

@@ -18,7 +18,22 @@ BACKOFF_FACTOR = 2
 
 # Concurrency configuration
 MAX_WORKERS = 10
-RATE_LIMIT_DELAY = 1  # seconds between requests
+RATE_LIMIT_DELAY = 0.1  # seconds between requests (aggressive mode for dynamic proxy)
+
+# PR Crawling Configuration
+MAX_CLOSED_PRS_TO_CRAWL = 1000  # Default maximum number of closed PRs to crawl (latest first)
+CRAWL_OPEN_PRS = False  # Whether to crawl open PRs (disabled per user request)
+CRAWL_CLOSED_PRS = True  # Whether to crawl closed PRs
+
+# Per-Repository PR Limits (optional - overrides default)
+# Format: "repository_url": max_closed_prs
+REPOSITORY_PR_LIMITS = {
+    # Examples:
+    # "https://github.com/apache/tvm": 3000,           # Large active project
+    # "https://github.com/facebook/react": 1000,      # Very active, recent PRs most important
+    # "https://github.com/microsoft/vscode": 5000,    # Huge project, need more history
+    # "https://github.com/small/project": 500,        # Small project, fewer PRs needed
+}
 
 # Logging configuration
 LOG_LEVEL = "INFO"
@@ -40,3 +55,8 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
+
+# Checkpoint configuration
+CHECKPOINT_DIR = "checkpoints"
+CHECKPOINT_DB_FILE = "crawled_repositories.json"
+MAX_CHECKPOINT_AGE_DAYS = 30  # Re-crawl repositories older than this

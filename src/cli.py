@@ -6,8 +6,8 @@ from typing import List
 import click
 from loguru import logger
 
-from .config import MAX_WORKERS, LOG_LEVEL, LOG_FILE, LOG_FORMAT
-from .io_handler import InputHandler, OutputHandler, FileManager
+from .config import MAX_WORKERS, LOG_LEVEL, LOG_FILE, LOG_FORMAT, MAX_CLOSED_PRS_TO_CRAWL
+from .io_handler import InputHandler, FileManager
 from .crawler import CrawlerManager
 
 
@@ -70,12 +70,17 @@ def setup_logging(log_level: str = LOG_LEVEL, log_file: str = LOG_FILE):
     help=f'Log file path (default: {LOG_FILE})'
 )
 @click.option(
+    '--max-closed-prs',
+    type=int,
+    help=f'Maximum number of closed PRs to crawl per repository (default: {MAX_CLOSED_PRS_TO_CRAWL})'
+)
+@click.option(
     '--dry-run',
     is_flag=True,
     help='Show what would be processed without actually crawling'
 )
-def main(input_files: tuple, star_threshold: int, output_dir: str, 
-         max_workers: int, log_level: str, log_file: str, dry_run: bool):
+def main(input_files: tuple, star_threshold: int, output_dir: str,
+         max_workers: int, log_level: str, log_file: str, dry_run: bool, max_closed_prs: int):
     """
     GitHub Repository Crawler
     
@@ -150,21 +155,19 @@ def main(input_files: tuple, star_threshold: int, output_dir: str,
             # Initialize crawler
             crawler_manager = CrawlerManager(max_workers)
             
-            # Crawl repositories
+            # Crawl repositories (results are written immediately to disk)
             logger.info(f"Starting crawl for {len(filtered_repos)} repositories")
-            crawled_repos = crawler_manager.process_repositories(
-                input_data.repositories, star_threshold
+            logger.info(f"Results will be written immediately to: {output_path}")
+
+            successful_count = crawler_manager.process_repositories(
+                input_data.repositories, star_threshold, output_dir, str(output_path)
             )
-            
-            # Save results
-            if crawled_repos:
-                success = OutputHandler.save_crawled_repositories(crawled_repos, str(output_path))
-                if success:
-                    logger.info(f"Successfully saved {len(crawled_repos)} repositories to {output_path}")
-                else:
-                    logger.error(f"Failed to save results to {output_path}")
+
+            # Results are already saved during crawling - just report the outcome
+            if successful_count > 0:
+                logger.info(f"Successfully crawled and saved {successful_count} new repositories to {output_path}")
             else:
-                logger.warning(f"No repositories were successfully crawled for {input_file}")
+                logger.info(f"No new repositories were crawled for {input_file} (all may have been previously crawled)")
         
         logger.info("GitHub Repository Crawler completed successfully")
         
