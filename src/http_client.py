@@ -13,11 +13,25 @@ from tenacity import (
     wait_exponential,
 )
 
+# Import for SOCKS5 support
+try:
+    # Try to import PySocks for SOCKS5 support
+    import socks
+    import socket
+    SOCKS_AVAILABLE = True
+except ImportError:
+    SOCKS_AVAILABLE = False
+
 from .config import (
     BACKOFF_FACTOR,
     DEFAULT_HEADERS,
     MAX_RETRIES,
     PROXIES,
+    PROXY_TYPE,
+    PROXY_HOST,
+    PROXY_PORT,
+    PROXY_USERNAME,
+    PROXY_PASSWORD,
     RATE_LIMIT_DELAY,
     REQUEST_TIMEOUT,
     RETRY_DELAY,
@@ -30,8 +44,41 @@ class HTTPClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
-        self.session.proxies.update(PROXIES)
+
+        # Configure proxy based on type
+        if PROXY_TYPE.lower() == "socks5":
+            self._configure_socks5_proxy()
+        else:
+            # HTTP proxy (legacy mode)
+            self.session.proxies.update(PROXIES)
+
         self.last_request_time = 0
+
+    def _configure_socks5_proxy(self):
+        """Configure SOCKS5 proxy with authentication support."""
+        if not SOCKS_AVAILABLE:
+            raise ImportError(
+                "PySocks is required for SOCKS5 proxy support. "
+                "Install it with: pip install requests[socks] or pip install PySocks"
+            )
+
+        if not PROXY_HOST:
+            raise ValueError("PROXY_HOST must be set when using SOCKS5 proxy")
+
+        # Set up SOCKS5 proxy
+        if PROXY_USERNAME and PROXY_PASSWORD:
+            # SOCKS5 with authentication
+            proxy_url = f"socks5://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
+        else:
+            # SOCKS5 without authentication
+            proxy_url = f"socks5://{PROXY_HOST}:{PROXY_PORT}"
+
+        self.session.proxies.update({
+            "http": proxy_url,
+            "https": proxy_url
+        })
+
+        logger.info(f"Configured SOCKS5 proxy: {PROXY_HOST}:{PROXY_PORT} (auth: {'yes' if PROXY_USERNAME else 'no'})")
 
     def _rate_limit(self):
         """Implement rate limiting between requests."""

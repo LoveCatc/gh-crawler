@@ -14,12 +14,14 @@ A Python application that crawls GitHub repositories to extract detailed informa
 ## Installation
 
 1. Clone the repository:
+
 ```bash
 git clone <repository-url>
 cd gh-crawler
 ```
 
 2. Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -116,13 +118,68 @@ Results are saved in JSONL format with detailed repository information:
 
 ## Configuration
 
-The crawler uses a proxy at `http://127.0.0.1:7892` by default. Make sure your proxy is running before starting the crawler.
+The crawler supports two proxy modes:
 
-Key configuration options in `src/config.py`:
-- `PROXY_URL`: Proxy server URL
+### 1. Localhost HTTP Proxy (Legacy Mode)
+
+For local non-authenticated proxy servers:
+
+```bash
+export PROXY_TYPE=http
+export PROXY_URL=http://127.0.0.1:7892
+```
+
+### 2. Remote SOCKS5 Proxy with Authentication
+
+For remote SOCKS5 proxy servers with authentication:
+
+```bash
+export PROXY_TYPE=socks5
+export PROXY_HOST=proxy.example.com
+export PROXY_PORT=1080
+export PROXY_USERNAME=your_username
+export PROXY_PASSWORD=your_password
+```
+
+### Environment Variables
+
+Copy `.env.example` to `.env` and configure:
+
+```bash
+# Proxy type: 'http' or 'socks5'
+PROXY_TYPE=socks5
+
+# For SOCKS5 proxy
+PROXY_HOST=your_proxy_host.com
+PROXY_PORT=1080
+PROXY_USERNAME=your_username
+PROXY_PASSWORD=your_password
+
+# For HTTP proxy (legacy)
+PROXY_URL=http://127.0.0.1:7892
+```
+
+### Key Configuration Options in `src/config.py`:
+
+- `PROXY_TYPE`: Proxy type ('http' or 'socks5')
+- `PROXY_HOST`: Remote proxy hostname (for SOCKS5)
+- `PROXY_PORT`: Remote proxy port (for SOCKS5)
+- `PROXY_USERNAME`: Proxy authentication username (for SOCKS5)
+- `PROXY_PASSWORD`: Proxy authentication password (for SOCKS5)
+- `PROXY_URL`: Proxy server URL (for HTTP)
 - `MAX_WORKERS`: Default number of concurrent workers
 - `REQUEST_TIMEOUT`: HTTP request timeout
 - `MAX_RETRIES`: Maximum retry attempts for failed requests
+
+### Dependencies
+
+For SOCKS5 proxy support, ensure PySocks is installed:
+
+```bash
+pip install PySocks
+# or
+pip install requests[socks]
+```
 
 ## Project Structure
 
@@ -150,6 +207,7 @@ gh-crawler/
 ## Logging
 
 The crawler provides comprehensive logging:
+
 - Console output with colored formatting
 - Log file with rotation (10MB files, 7 days retention)
 - Configurable log levels

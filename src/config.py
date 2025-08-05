@@ -1,14 +1,47 @@
 """Configuration settings for the GitHub crawler."""
 
 import os
-from typing import Dict, Any
+from typing import Dict
 
 # Proxy configuration
-PROXY_URL = "http://127.0.0.1:7892"
-PROXIES = {
-    "http": PROXY_URL,
-    "https": PROXY_URL
-}
+# Set PROXY_TYPE to 'http' for localhost non-auth proxy or 'socks5' for remote auth proxy
+PROXY_TYPE = os.getenv("PROXY_TYPE", "http")  # 'http' or 'socks5'
+
+# For localhost HTTP proxy (legacy mode)
+PROXY_URL = os.getenv("PROXY_URL", "http://127.0.0.1:7892")
+
+# For remote SOCKS5 proxy with authentication
+PROXY_HOST = os.getenv("PROXY_HOST", "")  # e.g., "proxy.example.com"
+PROXY_PORT = int(os.getenv("PROXY_PORT", "1080"))  # SOCKS5 default port
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
+
+# Build proxy configuration based on type
+def _build_proxy_config() -> Dict[str, str]:
+    """Build proxy configuration based on proxy type."""
+    if PROXY_TYPE.lower() == "socks5":
+        if not PROXY_HOST:
+            raise ValueError("PROXY_HOST must be set when using SOCKS5 proxy")
+
+        if PROXY_USERNAME and PROXY_PASSWORD:
+            # SOCKS5 with authentication
+            proxy_url = f"socks5://{PROXY_USERNAME}:{PROXY_PASSWORD}@{PROXY_HOST}:{PROXY_PORT}"
+        else:
+            # SOCKS5 without authentication
+            proxy_url = f"socks5://{PROXY_HOST}:{PROXY_PORT}"
+
+        return {
+            "http": proxy_url,
+            "https": proxy_url
+        }
+    else:
+        # HTTP proxy (localhost, legacy mode)
+        return {
+            "http": PROXY_URL,
+            "https": PROXY_URL
+        }
+
+PROXIES = _build_proxy_config()
 
 # Request configuration
 REQUEST_TIMEOUT = 30

@@ -1,13 +1,29 @@
-This python project aims to utilize various Proxy IPs to crawl some github projects' information. Do noy worry about the safety problem - we have contacted the github official and they told me to do so - as IP limits still apply, this will make sure we do not do harm to the website.
+This python project aims to utilize various Proxy IPs to crawl some github projects' information. Do not worry about the safety problem - we have contacted the github official and they told me to do so - as IP limits still apply, this will make sure we do not do harm to the website.
 
-The proxy usage is very simple. Just make sure all your requests are under the proxy address:
+The proxy system now supports two modes:
 
+## 1. Localhost HTTP Proxy (Legacy Mode)
+
+For local non-authenticated proxy servers:
+
+```bash
+export PROXY_TYPE=http
+export PROXY_URL=http://127.0.0.1:7892
 ```
-http://127.0.0.1:7892
+
+## 2. Remote SOCKS5 Proxy with Authentication
+
+For remote SOCKS5 proxy servers with authentication:
+
+```bash
+export PROXY_TYPE=socks5
+export PROXY_HOST=your_proxy_host.com
+export PROXY_PORT=1080
+export PROXY_USERNAME=your_username
+export PROXY_PASSWORD=your_password
 ```
 
-(both http_proxy and https_proxy)
-And each request sent out will be automatically proxied by the system.
+All requests sent out will be automatically proxied through the configured system.
 
 We will have several `.json` input file, and each file is in the following format:
 

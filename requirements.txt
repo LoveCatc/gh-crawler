@@ -4,3 +4,4 @@ loguru==0.7.2
 click==8.1.7
 dataclasses-json==0.6.1
 tenacity==8.2.3
+PySocks==1.7.1
