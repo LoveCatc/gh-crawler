@@ -6,9 +6,9 @@ from typing import List
 import click
 from loguru import logger
 
-from .config import MAX_WORKERS, LOG_LEVEL, LOG_FILE, LOG_FORMAT, MAX_CLOSED_PRS_TO_CRAWL
+from .config import MAX_WORKERS, LOG_LEVEL, LOG_FILE, LOG_FORMAT, MAX_CLOSED_PRS_TO_CRAWL, MIN_PRS_REQUIRED
 from .io_handler import InputHandler, FileManager
-from .crawler import CrawlerManager
+from .enhanced_crawler import EnhancedCrawlerManager
 
 
 def setup_logging(log_level: str = LOG_LEVEL, log_file: str = LOG_FILE):
@@ -102,6 +102,7 @@ def main(input_files: tuple, star_threshold: int, output_dir: str,
     logger.info(f"Star threshold: {star_threshold}")
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Max workers: {max_workers}")
+    logger.info(f"Minimum PRs required: {MIN_PRS_REQUIRED}")
     logger.info(f"Dry run: {dry_run}")
     
     try:
@@ -152,8 +153,8 @@ def main(input_files: tuple, star_threshold: int, output_dir: str,
                 logger.error(f"Failed to create output directory for {output_path}")
                 continue
             
-            # Initialize crawler
-            crawler_manager = CrawlerManager(max_workers)
+            # Initialize enhanced crawler
+            crawler_manager = EnhancedCrawlerManager(max_workers)
             
             # Crawl repositories (results are written immediately to disk)
             logger.info(f"Starting crawl for {len(filtered_repos)} repositories")

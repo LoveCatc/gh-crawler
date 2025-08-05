@@ -225,7 +225,9 @@ class PullRequestScraper:
                     else:
                         # Extract PR number for failed tracking
                         try:
-                            pr_number = int(pr_url.split('/pull/')[-1])
+                            # Handle URLs with fragments or query parameters
+                            pr_url_clean = pr_url.split('#')[0].split('?')[0]
+                            pr_number = int(pr_url_clean.split('/pull/')[-1])
                             self.checkpoint_manager.update_scraping_progress(state, pr_number, False, pr_url)
                         except (ValueError, IndexError):
                             logger.warning(f"Could not extract PR number from {pr_url}")
@@ -421,11 +423,14 @@ class PullRequestScraper:
             return None
 
     def _extract_pr_number(self, pr_url: str) -> Optional[int]:
-        """Extract PR number from URL."""
+        """Extract PR number from URL, handling fragments and query parameters."""
         try:
-            match = re.search(r"/pull/(\d+)", pr_url)
+            # Clean URL by removing fragments and query parameters
+            pr_url_clean = pr_url.split('#')[0].split('?')[0]
+            match = re.search(r"/pull/(\d+)", pr_url_clean)
             return int(match.group(1)) if match else None
-        except:
+        except Exception as e:
+            logger.debug(f"Could not extract PR number from {pr_url}: {e}")
             return None
 
     def _extract_title(self, soup: BeautifulSoup) -> str:
@@ -561,6 +566,7 @@ class PullRequestScraper:
         """Extract complete comment history in chronological order."""
         try:
             comments = []
+            seen_comments = set()  # Track unique comments to avoid duplicates
 
             # Look for timeline comments (includes the original PR description)
             comment_selectors = [
@@ -574,7 +580,12 @@ class PullRequestScraper:
                 for comment_elem in comment_elements:
                     comment = self._extract_single_comment(comment_elem)
                     if comment:
-                        comments.append(comment)
+                        # Use full content for deduplication to avoid false positives
+                        comment_key = comment.content.strip()
+
+                        if comment_key not in seen_comments:
+                            seen_comments.add(comment_key)
+                            comments.append(comment)
 
             # Sort comments by timestamp to ensure chronological order
             comments.sort(key=lambda c: c.timestamp)
@@ -627,30 +638,55 @@ class PullRequestScraper:
             return None
 
     def _extract_related_issue_ids(self, soup: BeautifulSoup) -> List[int]:
-        """Extract related issue numbers mentioned in PR."""
+        """Extract related issue numbers mentioned in PR comments and description."""
         try:
             related_issues = []
 
-            # Look for issue references in the PR body and comments
+            # Look for issue references in PR description and comments
+            # Focus on actual issue links and keywords that indicate issues, not PRs
+
+            # 1. Find direct issue links in href attributes
+            issue_links = soup.find_all('a', href=re.compile(r'/issues/(\d+)'))
+            for link in issue_links:
+                href = link.get('href', '')
+                match = re.search(r'/issues/(\d+)', href)
+                if match:
+                    issue_num = int(match.group(1))
+                    if issue_num not in related_issues:
+                        related_issues.append(issue_num)
+
+            # 2. Look for issue references with specific keywords (not just any #number)
             text_content = soup.get_text()
 
-            # Find issue references like #123, fixes #123, closes #123
-            issue_patterns = [
-                r"#(\d+)",
-                r"fixes?\s+#(\d+)",
-                r"closes?\s+#(\d+)",
-                r"resolves?\s+#(\d+)",
+            # Only match #numbers that are clearly referring to issues, not PRs
+            issue_keywords_patterns = [
+                r"(?:fixes?|closes?|resolves?|addresses?)\s+#(\d+)",
+                r"(?:fix|close|resolve|address)\s+#(\d+)",
+                r"(?:issue|bug)\s+#(\d+)",
+                r"(?:see|related to|duplicate of)\s+(?:issue\s+)?#(\d+)",
             ]
 
-            for pattern in issue_patterns:
+            for pattern in issue_keywords_patterns:
                 matches = re.findall(pattern, text_content, re.IGNORECASE)
                 for match in matches:
                     issue_num = int(match)
                     if issue_num not in related_issues:
                         related_issues.append(issue_num)
 
+            # 3. Look for issue references in comment text (more targeted)
+            comments = soup.find_all('div', class_=re.compile(r'comment-body'))
+            for comment in comments:
+                comment_text = comment.get_text()
+                # Only look for explicit issue references in comments
+                issue_refs = re.findall(r"(?:issue|bug|problem)\s+#(\d+)", comment_text, re.IGNORECASE)
+                for issue_ref in issue_refs:
+                    issue_num = int(issue_ref)
+                    if issue_num not in related_issues:
+                        related_issues.append(issue_num)
+
             return related_issues[:5]  # Limit to first 5 related issues
-        except:
+        except Exception as e:
+            logger.warning(f"Error extracting related issue IDs: {e}")
             return []
 
     def _extract_related_issues_content(self, pr_url: str, issue_ids: List[int]) -> List[IssueInfo]:
@@ -660,15 +696,30 @@ class PullRequestScraper:
             # PR URL format: https://github.com/owner/repo/pull/123
             repo_url = "/".join(pr_url.split("/")[:5])  # https://github.com/owner/repo
 
+            # Extract current PR number to avoid scraping it as an issue
+            # Handle URLs with fragments or query parameters
+            pr_url_clean = pr_url.split('#')[0].split('?')[0]  # Remove fragments and query params
+            pr_number = int(pr_url_clean.split("/")[-1])
+
             related_issues = []
             for issue_id in issue_ids:
+                # Skip if this is the same number as the current PR
+                if issue_id == pr_number:
+                    logger.debug(f"Skipping issue #{issue_id} as it's the current PR number")
+                    continue
+
+                # Skip very high numbers that are likely PR numbers (issues are usually lower)
+                if issue_id > 50000:  # Reasonable threshold for most repositories
+                    logger.debug(f"Skipping issue #{issue_id} as it's likely a PR number (too high)")
+                    continue
+
                 logger.debug(f"Scraping related issue #{issue_id} for PR {pr_url}")
                 issue_info = self.issue_scraper.scrape_issue(repo_url, issue_id)
                 if issue_info:
                     related_issues.append(issue_info)
                     logger.debug(f"Successfully scraped related issue #{issue_id}")
                 else:
-                    logger.warning(f"Failed to scrape related issue #{issue_id}")
+                    logger.debug(f"Issue #{issue_id} not found (may not exist or may be a PR)")
 
             return related_issues
         except Exception as e:

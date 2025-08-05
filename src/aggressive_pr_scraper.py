@@ -16,12 +16,20 @@ from .config import MAX_CLOSED_PRS_TO_CRAWL, CRAWL_OPEN_PRS, CRAWL_CLOSED_PRS, R
 
 class AggressivePRScraper:
     """Aggressive parallel PR scraper optimized for dynamic proxy systems."""
-    
-    def __init__(self, max_workers: int = 20, discovery_workers: int = 10):
+
+    def __init__(self, max_workers: int = 20, discovery_workers: int = 10, cache_manager=None):
         self.max_workers = max_workers
         self.discovery_workers = discovery_workers
-        self.checkpoint_manager = PRCheckpointManager()
-        self.cache_manager = PRCacheManager()
+
+        # Use unified cache manager if provided, otherwise fall back to legacy managers
+        if cache_manager:
+            self.unified_cache = cache_manager
+            self.checkpoint_manager = None
+            self.cache_manager = None
+        else:
+            self.unified_cache = None
+            self.checkpoint_manager = PRCheckpointManager()
+            self.cache_manager = PRCacheManager()
 
         # Create multiple HTTP clients for parallel processing
         self.http_clients = [HTTPClient() for _ in range(max_workers)]
@@ -32,6 +40,78 @@ class AggressivePRScraper:
         self.discovered_count = 0
         self.scraped_count = 0
         self.failed_count = 0
+
+    def _save_state(self, state):
+        """Save state using appropriate manager."""
+        if self.unified_cache:
+            self.unified_cache.save_crawl_state(state)
+        else:
+            self.checkpoint_manager.save_state(state)
+
+    def _update_discovery_progress(self, state, pr_state, page_num, page_urls, is_complete):
+        """Update discovery progress using appropriate manager."""
+        if self.unified_cache:
+            # Update state manually for unified cache
+            if pr_state == "open":
+                state.last_open_page = page_num
+                if is_complete:
+                    state.open_pages_complete = True
+            else:
+                state.last_closed_page = page_num
+                if is_complete:
+                    state.closed_pages_complete = True
+
+            # Add URLs to discovered list
+            for url in page_urls:
+                if url not in state.discovered_pr_urls:
+                    state.discovered_pr_urls.append(url)
+        else:
+            self.checkpoint_manager.update_discovery_progress(state, pr_state, page_num, page_urls, is_complete)
+
+    def _update_scraping_progress(self, state, pr_number, success, pr_url=None):
+        """Update scraping progress using appropriate manager."""
+        if self.unified_cache:
+            # Update state manually for unified cache
+            if success:
+                if pr_number not in state.scraped_pr_numbers:
+                    state.scraped_pr_numbers.append(pr_number)
+            else:
+                if pr_url and pr_url not in state.failed_pr_urls:
+                    state.failed_pr_urls.append(pr_url)
+        else:
+            self.checkpoint_manager.update_scraping_progress(state, pr_number, success, pr_url)
+
+    def _get_remaining_urls(self, state):
+        """Get remaining URLs using appropriate manager."""
+        if self.unified_cache:
+            # Implement logic manually for unified cache
+            scraped_numbers = set(state.scraped_pr_numbers)
+            failed_urls = set(state.failed_pr_urls)
+
+            remaining = []
+            for url in state.discovered_pr_urls:
+                if url in failed_urls:
+                    continue
+
+                # Extract PR number from URL
+                try:
+                    pr_number = int(url.split('/pull/')[-1])
+                    if pr_number not in scraped_numbers:
+                        remaining.append(url)
+                except (ValueError, IndexError):
+                    # If we can't extract number, include it to be safe
+                    remaining.append(url)
+
+            return remaining
+        else:
+            return self.checkpoint_manager.get_remaining_urls(state)
+
+    def _cache_pr_immediately(self, repo_url, pr_info):
+        """Cache PR using appropriate manager."""
+        if self.unified_cache:
+            self.unified_cache.cache_pr_immediately(repo_url, pr_info)
+        else:
+            self.cache_manager.cache_pr_immediately(repo_url, pr_info)
 
     def get_pr_limit_for_repo(self, repo_url: str, default_limit: int = None) -> int:
         """Get the PR limit for a specific repository."""
@@ -55,21 +135,35 @@ class AggressivePRScraper:
             logger.info(f"Strategy: Latest {actual_limit:,} closed PRs + all open PRs")
 
             # Load or create checkpoint state
-            state = self.checkpoint_manager.load_state(repo_url)
-            if state is None:
-                # Adjust expected total based on our crawling strategy
-                expected_to_crawl = actual_limit + 100  # Estimate for open PRs
-                state = self.checkpoint_manager.create_initial_state(repo_url, expected_to_crawl)
-                logger.info("Starting fresh aggressive PR crawl")
-            else:
-                progress = self.checkpoint_manager.get_progress_summary(state)
-                logger.info(f"Resuming aggressive PR crawl:")
-                logger.info(f"  - Discovered: {progress['discovered']:,} URLs")
-                logger.info(f"  - Scraped: {progress['scraped']:,} PRs")
-                logger.info(f"  - Coverage: {progress['coverage_percent']:.1f}%")
+            if self.unified_cache:
+                state = self.unified_cache.load_crawl_state(repo_url)
+                if state is None:
+                    expected_to_crawl = actual_limit + 100  # Estimate for open PRs
+                    state = self.unified_cache.create_initial_crawl_state(repo_url, expected_to_crawl)
+                    logger.info("Starting fresh aggressive PR crawl")
+                else:
+                    logger.info(f"Resuming aggressive PR crawl:")
+                    logger.info(f"  - Discovered: {len(state.discovered_pr_urls):,} URLs")
+                    logger.info(f"  - Scraped: {len(state.scraped_pr_numbers):,} PRs")
 
-            # Get already cached PRs to avoid re-scraping
-            cached_pr_numbers = self.cache_manager.get_cached_pr_numbers(repo_url)
+                # Get already cached PRs to avoid re-scraping
+                cached_pr_numbers = self.unified_cache.get_cached_pr_numbers(repo_url)
+            else:
+                state = self.checkpoint_manager.load_state(repo_url)
+                if state is None:
+                    expected_to_crawl = actual_limit + 100  # Estimate for open PRs
+                    state = self.checkpoint_manager.create_initial_state(repo_url, expected_to_crawl)
+                    logger.info("Starting fresh aggressive PR crawl")
+                else:
+                    progress = self.checkpoint_manager.get_progress_summary(state)
+                    logger.info(f"Resuming aggressive PR crawl:")
+                    logger.info(f"  - Discovered: {progress['discovered']:,} URLs")
+                    logger.info(f"  - Scraped: {progress['scraped']:,} PRs")
+                    logger.info(f"  - Coverage: {progress['coverage_percent']:.1f}%")
+
+                # Get already cached PRs to avoid re-scraping
+                cached_pr_numbers = self.cache_manager.get_cached_pr_numbers(repo_url)
+
             logger.info(f"Found {len(cached_pr_numbers)} already cached PRs")
 
             # Phase 1: Aggressive URL Discovery (focused strategy)
@@ -87,20 +181,42 @@ class AggressivePRScraper:
                 logger.info("✅ Phase 2: PR scraping already complete")
 
             # Force flush cache
-            self.cache_manager.force_flush()
+            if self.unified_cache:
+                # For unified cache, manually flush the queue
+                with self.unified_cache.write_lock:
+                    self.unified_cache._flush_queue()
+            else:
+                self.cache_manager.force_flush()
 
             # Load all results
-            all_prs = self.cache_manager.load_cached_prs(repo_url)
+            if self.unified_cache:
+                all_prs = self.unified_cache.load_cached_prs(repo_url)
+            else:
+                all_prs = self.cache_manager.load_cached_prs(repo_url)
             
             # Final stats
-            final_progress = self.checkpoint_manager.get_progress_summary(state)
-            cache_stats = self.cache_manager.get_cache_stats(repo_url)
+            if self.unified_cache:
+                cache_stats = self.unified_cache.get_cache_stats(repo_url)
+                logger.info(f"✅ AGGRESSIVE crawl complete: {len(state.scraped_pr_numbers):,} PRs scraped")
+                logger.info(f"  - Total PRs found: {len(all_prs):,}")
+                logger.info(f"  - Cached PRs: {cache_stats.get('cached_pr_count', 0):,}")
+            else:
+                final_progress = self.checkpoint_manager.get_progress_summary(state)
+                cache_stats = self.cache_manager.get_cache_stats(repo_url)
+                logger.info(f"✅ AGGRESSIVE crawl complete: {final_progress['scraped']:,} PRs scraped")
+                logger.info(f"  - Total PRs found: {len(all_prs):,}")
+                logger.info(f"  - Cache size: {cache_stats.get('file_size_mb', 0):.1f} MB")
             
             logger.info(f"🎉 AGGRESSIVE PR crawl completed for {repo_url}:")
-            logger.info(f"  - Total discovered: {final_progress['discovered']:,}")
-            logger.info(f"  - Successfully scraped: {len(all_prs):,}")
-            logger.info(f"  - Cache size: {cache_stats['file_size_mb']:.1f} MB")
-            logger.info(f"  - Coverage: {(len(all_prs) / max(total_prs_expected, 1)) * 100:.1f}%")
+            if self.unified_cache:
+                logger.info(f"  - Total discovered: {len(state.discovered_pr_urls):,}")
+                logger.info(f"  - Successfully scraped: {len(all_prs):,}")
+                logger.info(f"  - Coverage: {(len(all_prs) / max(total_prs_expected, 1)) * 100:.1f}%")
+            else:
+                logger.info(f"  - Total discovered: {final_progress['discovered']:,}")
+                logger.info(f"  - Successfully scraped: {len(all_prs):,}")
+                logger.info(f"  - Cache size: {cache_stats.get('file_size_mb', 0):.1f} MB")
+                logger.info(f"  - Coverage: {(len(all_prs) / max(total_prs_expected, 1)) * 100:.1f}%")
 
             return all_prs
 
@@ -138,7 +254,11 @@ class AggressivePRScraper:
                 (not CRAWL_OPEN_PRS or state.open_pages_complete) and
                 (not CRAWL_CLOSED_PRS or state.closed_pages_complete)
             )
-            self.checkpoint_manager.save_state(state)
+
+            if self.unified_cache:
+                self.unified_cache.save_crawl_state(state)
+            else:
+                self.checkpoint_manager.save_state(state)
 
             logger.info(f"🎯 URL discovery complete: {len(state.discovered_pr_urls):,} URLs found")
 
@@ -150,15 +270,21 @@ class AggressivePRScraper:
         """Discover PR URLs for a specific state with optional limit (for closed PRs)."""
         try:
             start_page = state.last_open_page + 1 if pr_state == "open" else state.last_closed_page + 1
-            max_pages = 2000  # Increased for infinite persistence
+            max_pages = 500  # Reasonable upper bound - most repos don't have 500 pages
+            max_consecutive_empty = 3  # Stop after 3 consecutive empty pages
 
-            if limit:
-                logger.info(f"🔍 Starting {pr_state} PR discovery from page {start_page} (limit: {limit:,}) with exponential backoff")
+            # NO SMART LIMIT - User wants at least 1000 PRs crawled without tricks
+            effective_limit = limit
+
+            if effective_limit:
+                logger.info(f"🔍 AGGRESSIVE {pr_state} PR discovery from page {start_page} (limit: {effective_limit:,})")
             else:
-                logger.info(f"🔍 Starting {pr_state} PR discovery from page {start_page} (no limit) with exponential backoff")
-            
-            # Use multiple workers for page discovery
-            with ThreadPoolExecutor(max_workers=5) as executor:
+                logger.info(f"🔍 AGGRESSIVE {pr_state} PR discovery from page {start_page} (no limit)")
+
+            limit = effective_limit
+
+            # Use AGGRESSIVE workers for page discovery
+            with ThreadPoolExecutor(max_workers=15) as executor:
                 page = start_page
                 consecutive_empty = 0
                 consecutive_failures = 0
@@ -167,38 +293,44 @@ class AggressivePRScraper:
                 # Count PRs discovered for this state (open/closed) by tracking in checkpoint
                 total_found = getattr(state, f'{pr_state}_prs_found', 0)
 
-                # Keep going until we hit the limit - infinite persistence with smart backoff!
+                # Keep going until we hit the limit OR run out of pages
                 while page <= max_pages:
-                    # If we've had too many consecutive failures, increase the backoff significantly
-                    if consecutive_failures > 10:
-                        logger.info(f"🔄 Many consecutive failures ({consecutive_failures}), using extended backoff...")
-                        time.sleep(min(consecutive_failures * 5, 300))  # Up to 5 minutes
-                    # Check if we've hit the limit for closed PRs
+                    # AGGRESSIVE EXIT: Stop immediately if we have enough URLs
                     if limit and total_found >= limit:
-                        logger.info(f"✅ Reached limit of {limit:,} {pr_state} PRs")
+                        logger.info(f"🎯 STOPPING DISCOVERY: Found {total_found:,} {pr_state} PRs (target: {limit:,})")
                         break
-                    # Submit batch of pages (smaller batch for better rate limit handling)
-                    batch_size = 3
+
+                    # INTELLIGENT STOP: Stop when we run out of pages OR hit limit
+                    if consecutive_empty >= max_consecutive_empty:
+                        logger.info(f"🛑 STOPPING: {consecutive_empty} consecutive empty pages - no more {pr_state} PRs available")
+                        break
+
+                    # Submit batch of pages - reduce size if rate limited
+                    batch_size = max(1, 10 - consecutive_failures)  # Reduce batch size when rate limited
                     futures = []
-                    
+
+                    logger.info(f"🚀 AGGRESSIVE BATCH: Processing pages {page}-{page+batch_size-1} (found: {total_found:,})")
+
                     for i in range(batch_size):
                         if page + i > max_pages:
                             break
-                        
+
                         future = executor.submit(
-                            self._fetch_page_urls, 
-                            state.repo_url, 
-                            pr_state, 
+                            self._fetch_page_urls,
+                            state.repo_url,
+                            pr_state,
                             page + i
                         )
                         futures.append((page + i, future))
-                    
+
                     # Process results
                     batch_found = 0
                     batch_failures = 0
+                    batch_empty_pages = 0
+
                     for page_num, future in futures:
                         try:
-                            page_urls = future.result(timeout=30)
+                            page_urls = future.result(timeout=10)  # Faster timeout for aggression
 
                             if page_urls:
                                 # Apply limit if specified
@@ -208,24 +340,24 @@ class AggressivePRScraper:
                                         break
                                     page_urls = page_urls[:remaining_slots]
 
-                                consecutive_empty = 0
+                                consecutive_empty = 0  # Reset on success
                                 consecutive_failures = 0  # Reset on success
                                 backoff_delay = 1  # Reset backoff on success
                                 batch_found += len(page_urls)
 
-                                self.checkpoint_manager.update_discovery_progress(
+                                self._update_discovery_progress(
                                     state, pr_state, page_num, page_urls, False
                                 )
 
                                 # Update total_found from the state after checkpoint update
                                 total_found = getattr(state, f'{pr_state}_prs_found', 0)
 
-                                # Check if we've hit the limit
+                                # IMMEDIATE EXIT if we've hit the limit
                                 if limit and total_found >= limit:
-                                    logger.info(f"🎯 Reached target limit of {limit:,} {pr_state} PRs!")
-                                    break
+                                    logger.info(f"🎯 TARGET REACHED: {total_found:,} {pr_state} PRs! STOPPING DISCOVERY!")
+                                    return  # Exit immediately, don't process more batches
                             else:
-                                consecutive_empty += 1
+                                batch_empty_pages += 1
 
                         except Exception as e:
                             logger.warning(f"Failed to fetch page {page_num}: {e}")
@@ -234,26 +366,56 @@ class AggressivePRScraper:
                             # Count failures for exponential backoff
                             if "429" in str(e) or "rate limit" in str(e).lower():
                                 consecutive_failures += 1
-                                logger.info(f"Rate limit hit, consecutive failures: {consecutive_failures}")
+                                logger.debug(f"Rate limit hit on page {page_num}, consecutive failures: {consecutive_failures}")
+                                # DO NOT count rate limits as empty pages - they should be retried
                             else:
-                                consecutive_empty += 1
+                                batch_empty_pages += 1
+                                logger.debug(f"Non-rate-limit error on page {page_num}: {e}")
+
+                    # Update consecutive empty count based on this batch
+                    if batch_empty_pages == len(futures):
+                        # All pages in batch were empty - count as 1 consecutive empty batch
+                        consecutive_empty += 1
+                    elif batch_found > 0:
+                        # Found some PRs, reset consecutive empty
+                        consecutive_empty = 0
+                    else:
+                        # Mixed results, increment by 1 (partial empty batch)
+                        consecutive_empty += 1
 
                     page += batch_size
 
-                    # Only break if we hit the limit - ignore consecutive empty pages!
+                    # IMMEDIATE EXIT if we hit the limit!
                     if limit and total_found >= limit:
-                        logger.info(f"🎯 Reached target limit of {limit:,} {pr_state} PRs!")
+                        logger.info(f"🎯 FINAL EXIT: {total_found:,} {pr_state} PRs found! Moving to scraping!")
                         break
 
-                    # Exponential backoff for rate limiting
+                    # ONLY delay if we have actual rate limiting errors
                     if batch_failures > 0:
-                        # Exponential backoff: double the delay each time, up to max
-                        backoff_delay = min(backoff_delay * 2, max_backoff)
-                        logger.info(f"⏳ Rate limiting detected, backing off for {backoff_delay}s (failures: {consecutive_failures})")
-                        time.sleep(backoff_delay)
-                    elif consecutive_empty > 0:
-                        # Small delay for empty pages
-                        time.sleep(2)
+                        # Check if failures are actually rate limiting (429 errors)
+                        rate_limit_failures = 0
+                        for page_num, future in futures:
+                            try:
+                                if future.exception() and "429" in str(future.exception()):
+                                    rate_limit_failures += 1
+                            except:
+                                pass
+
+                        if rate_limit_failures > 0:
+                            backoff_delay = min(backoff_delay * 2, max_backoff)
+                            logger.info(f"⏳ Rate limiting detected ({rate_limit_failures}/{len(futures)} pages), backing off for {backoff_delay}s")
+                            time.sleep(backoff_delay)
+
+                            # If we're getting heavily rate limited, increase delays more aggressively
+                            if rate_limit_failures >= len(futures) * 0.8:  # 80% of requests rate limited
+                                logger.warning(f"🚨 HEAVY rate limiting detected! Increasing backoff to {backoff_delay * 2}s")
+                                time.sleep(backoff_delay)  # Additional delay
+                        else:
+                            # Non-rate-limit errors, just continue aggressively
+                            logger.debug(f"Non-rate-limit errors detected, continuing aggressively")
+                            # Reset backoff on success
+                            backoff_delay = 1
+                    # NO delay for empty pages - keep going at full speed!
             
             # Mark this state as complete
             if pr_state == "open":
@@ -261,7 +423,7 @@ class AggressivePRScraper:
             else:
                 state.closed_pages_complete = True
 
-            self.checkpoint_manager.save_state(state)
+            self._save_state(state)
             logger.info(f"✅ Completed {pr_state} PR discovery: {total_found:,} URLs found")
 
         except Exception as e:
@@ -297,7 +459,7 @@ class AggressivePRScraper:
     def _scrape_prs_aggressively(self, state: PRCrawlState, cached_pr_numbers: Set[int]) -> None:
         """Scrape PRs with maximum parallelism."""
         try:
-            remaining_urls = self.checkpoint_manager.get_remaining_urls(state)
+            remaining_urls = self._get_remaining_urls(state)
             
             # Filter out already cached PRs
             filtered_urls = []
@@ -341,21 +503,25 @@ class AggressivePRScraper:
                             pr_info = future.result(timeout=60)
                             if pr_info:
                                 # Cache immediately
-                                self.cache_manager.cache_pr_immediately(state.repo_url, pr_info)
-                                self.checkpoint_manager.update_scraping_progress(state, pr_info.number, True)
+                                self._cache_pr_immediately(state.repo_url, pr_info)
+                                self._update_scraping_progress(state, pr_info.number, True)
                                 scraped_count += 1
                             else:
                                 pr_number = int(url.split('/pull/')[-1]) if '/pull/' in url else 0
-                                self.checkpoint_manager.update_scraping_progress(state, pr_number, False, url)
+                                self._update_scraping_progress(state, pr_number, False, url)
                                 
                         except Exception as e:
                             logger.warning(f"Failed to scrape {url}: {e}")
                     
                     # Progress update
                     if scraped_count % 100 == 0:
-                        progress = self.checkpoint_manager.get_progress_summary(state)
-                        logger.info(f"⚡ Progress: {scraped_count}/{total_to_scrape} in batch, "
-                                  f"{progress['scraped']:,} total, {progress['coverage_percent']:.1f}% coverage")
+                        if self.unified_cache:
+                            logger.info(f"⚡ Progress: {scraped_count}/{total_to_scrape} in batch, "
+                                      f"{len(state.scraped_pr_numbers):,} total scraped")
+                        else:
+                            progress = self.checkpoint_manager.get_progress_summary(state)
+                            logger.info(f"⚡ Progress: {scraped_count}/{total_to_scrape} in batch, "
+                                      f"{progress['scraped']:,} total, {progress['coverage_percent']:.1f}% coverage")
             
             logger.info(f"🎉 Aggressive scraping completed: {scraped_count} PRs scraped in this session")
             

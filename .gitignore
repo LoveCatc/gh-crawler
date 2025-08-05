@@ -1,2 +1,9 @@
 *.log 
 *.pyc
+clash*
+clash_script/
+*repos.json
+*.jsonl
+*.json
+pr_cache/
+cache/

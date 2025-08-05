@@ -56,7 +56,16 @@ DEFAULT_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# Checkpoint configuration
+# Unified cache configuration
+CACHE_DIR = "cache"
+CACHE_PR_SUBDIR = "prs"
+CACHE_CHECKPOINT_SUBDIR = "checkpoints"
+CACHE_COMMITS_SUBDIR = "commits"
+
+# Legacy checkpoint configuration (deprecated)
 CHECKPOINT_DIR = "checkpoints"
 CHECKPOINT_DB_FILE = "crawled_repositories.json"
 MAX_CHECKPOINT_AGE_DAYS = 30  # Re-crawl repositories older than this
+
+# Minimum PR requirements
+MIN_PRS_REQUIRED = 1000  # Target number of closed PRs to crawl: min(1000, num_all_closed_PRs)

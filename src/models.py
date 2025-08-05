@@ -71,6 +71,9 @@ class PullRequestInfo:
     comments: List[Comment] = field(default_factory=list)
     related_issues: List[IssueInfo] = field(default_factory=list)  # Full issue content
     url: str = ""
+    commit_ids: List[str] = field(default_factory=list)  # Commit IDs associated with this PR
+    commit_id: str = ""  # Primary commit ID for this PR
+    previous_commit_id: str = ""  # Previous commit ID in repository history
 
 
 @dataclass_json
@@ -95,13 +98,16 @@ class CrawledRepository:
     url: str
     stars: int
     language: List[str]
-    
+
     # Crawled statistics
     stats: RepositoryStats
-    
+
     # Detailed PR information
     pull_requests: List[PullRequestInfo] = field(default_factory=list)
-    
+
+    # Repository commit information
+    commit_ids: List[str] = field(default_factory=list)  # Repository commit IDs
+
     # Metadata
     crawl_timestamp: Optional[str] = None
     crawl_success: bool = True
