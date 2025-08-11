@@ -15,6 +15,7 @@ class RepositoryScraper:
 
     def __init__(self, http_client: HTTPClient):
         self.client = http_client
+        self.last_error = None  # Store detailed error message for the caller
 
     def scrape_repository_stats(
         self, repo_url: str
@@ -26,7 +27,11 @@ class RepositoryScraper:
             # Get main repository page
             soup = self.client.get_soup(repo_url)
             if not soup:
-                logger.error(f"Failed to get repository page: {repo_url}")
+                # Try to get more specific error information
+                error_msg = self._get_detailed_error_message(repo_url)
+                logger.error(f"Failed to get repository page: {repo_url} - {error_msg}")
+                # Store the detailed error message for the caller
+                self.last_error = error_msg
                 return None
 
             stats = RepositoryStats()
@@ -54,13 +59,48 @@ class RepositoryScraper:
                     stats.open_pull_requests,
                     stats.closed_pull_requests,
                 ) = pr_counts
+                # Mark PR counts available only if we actually parsed any (>0)
+                stats.pr_counts_available = any([
+                    stats.total_pull_requests,
+                    stats.open_pull_requests,
+                    stats.closed_pull_requests,
+                ])
+            else:
+                stats.pr_counts_available = False
 
             logger.info(f"Successfully scraped stats for {repo_url}")
             return stats
 
         except Exception as e:
-            logger.error(f"Error scraping repository stats for {repo_url}: {e}")
+            error_msg = f"Error scraping repository stats for {repo_url}: {e}"
+            logger.error(error_msg)
+            self.last_error = str(e)
             return None
+
+    def _get_detailed_error_message(self, repo_url: str) -> str:
+        """Get detailed error message for failed repository access."""
+        try:
+            # Try to make a direct request to get the HTTP status code
+            import requests
+            response = self.client.session.get(repo_url, timeout=10)
+
+            if response.status_code == 404:
+                return "Repository not found (404) - it may have been deleted, made private, or the URL is incorrect"
+            elif response.status_code == 403:
+                return "Access forbidden (403) - repository may be private or rate limited"
+            elif response.status_code == 429:
+                return "Rate limited (429) - too many requests"
+            elif response.status_code >= 500:
+                return f"Server error ({response.status_code}) - GitHub may be experiencing issues"
+            else:
+                return f"HTTP error ({response.status_code})"
+
+        except requests.exceptions.Timeout:
+            return "Request timeout - network or server issues"
+        except requests.exceptions.ConnectionError:
+            return "Connection error - network issues or invalid URL"
+        except Exception as e:
+            return f"Unknown error: {str(e)}"
 
     def _extract_contributors_count(
         self, soup: BeautifulSoup, repo_url: str

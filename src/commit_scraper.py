@@ -6,13 +6,14 @@ from loguru import logger
 from bs4 import BeautifulSoup
 
 from .http_client import HTTPClient
+from .config import ENABLE_PROXY_REFRESH
 
 
 class CommitScraper:
     """Scraper for extracting commit information from GitHub repositories."""
     
     def __init__(self, http_client: HTTPClient = None):
-        self.http_client = http_client or HTTPClient()
+        self.http_client = http_client or HTTPClient(enable_proxy_refresh=ENABLE_PROXY_REFRESH)
     
     def scrape_repository_commits(self, repo_url: str, max_commits: int = 1000) -> List[str]:
         """Scrape commit IDs from a repository's commit history.
@@ -43,7 +44,7 @@ class CommitScraper:
                     logger.warning(f"Failed to fetch commits page {page} for {repo_url}")
                     break
                 
-                soup = BeautifulSoup(response.text, 'html.parser')
+                soup = BeautifulSoup(response.text, 'lxml')
                 
                 # Find commit links - they have the pattern /owner/repo/commit/sha
                 commit_links = soup.find_all('a', href=re.compile(r'/commit/[a-f0-9]{40}'))
@@ -106,7 +107,7 @@ class CommitScraper:
                 logger.warning(f"Failed to fetch PR page for {pr_url}")
                 return []
 
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(response.text, 'lxml')
 
             # Look for the merge commit ID in the PR page
             merge_commit_id = self._extract_merge_commit_id(soup)
@@ -361,7 +362,7 @@ class CommitScraper:
                 logger.warning(f"Failed to fetch commit details for {commit_sha}")
                 return None
             
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(response.text, 'lxml')
             
             # Extract commit information
             commit_info = {

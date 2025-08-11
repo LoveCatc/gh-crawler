@@ -12,14 +12,22 @@ from .http_client import HTTPClient
 from .models import PullRequestInfo, Comment, IssueInfo
 from .issue_scraper import IssueScraper
 from .pr_checkpoint_manager import PRCheckpointManager, PRCrawlState
+from .failed_issue_cache import FailedIssueCache
+from .issue_validator import IssueValidator
 
 
 class PullRequestScraper:
     """Scraper for detailed pull request information with resume functionality."""
 
-    def __init__(self, http_client: HTTPClient):
+    def __init__(self, http_client: HTTPClient, failed_cache: FailedIssueCache = None, validator: IssueValidator = None):
         self.client = http_client
-        self.issue_scraper = IssueScraper(http_client)
+
+        # Initialize shared caches for issue optimization
+        self.failed_cache = failed_cache or FailedIssueCache()
+        self.validator = validator or IssueValidator()
+
+        # Pass shared caches to issue scraper
+        self.issue_scraper = IssueScraper(http_client, self.failed_cache, self.validator)
         self.checkpoint_manager = PRCheckpointManager()
 
     def scrape_pull_requests(
@@ -334,38 +342,161 @@ class PullRequestScraper:
             return []
 
     def _extract_pr_urls_from_page(self, soup, repo_url: str) -> List[str]:
-        """Extract PR URLs from a single page."""
+        """Extract PR URLs from a single page using robust selectors."""
         try:
             pr_urls = []
+            seen_pr_numbers = set()
 
-            # Look for PR links with various selectors
+            # Comprehensive selectors for GitHub's current structure
+            # These are ordered by specificity and reliability
             selectors = [
-                "a.Link--primary",  # Primary link class
+                # Modern GitHub PR list selectors (most reliable)
+                "div[data-testid='issue-row'] a[href*='/pull/']",  # New GitHub UI
+                ".js-issue-row a[href*='/pull/']",  # Issue row containers
+                ".js-navigation-item a[href*='/pull/']",  # Navigation items
+
+                # PR title links (primary targets)
+                "a[data-hovercard-type='pull_request']",  # PR hovercard links
+                "a.Link--primary[href*='/pull/']",  # Primary links to PRs
+                "a.v-align-middle[href*='/pull/']",  # Vertically aligned PR links
+
+                # Fallback selectors for different GitHub layouts
+                ".Box-row a[href*='/pull/']",  # Box layout PR links
+                ".issue-title-link[href*='/pull/']",  # Issue title links
+                "h3 a[href*='/pull/']",  # Header links
+                "h4 a[href*='/pull/']",  # Subheader links
+
+                # Broad fallback (least specific, most comprehensive)
                 "a[href*='/pull/']",  # Any link containing /pull/
-                ".js-navigation-item a[href*='/pull/']",  # Navigation item links
             ]
 
             for selector in selectors:
-                pr_links = soup.select(selector)
+                try:
+                    pr_links = soup.select(selector)
 
-                for link in pr_links:
-                    href = link.get("href")
-                    if href and "/pull/" in href and href not in [url.split('/')[-1] for url in pr_urls]:
+                    for link in pr_links:
+                        href = link.get("href")
+                        if not href or "/pull/" not in href:
+                            continue
+
+                        # Extract PR number for deduplication
+                        pr_number = self._extract_pr_number_from_href(href)
+                        if not pr_number or pr_number in seen_pr_numbers:
+                            continue
+
                         # Construct full URL properly
                         if href.startswith("/"):
                             full_url = "https://github.com" + href
+                        elif href.startswith("http"):
+                            full_url = href
                         else:
                             full_url = repo_url.rstrip("/") + "/" + href.lstrip("/")
 
-                        # Avoid duplicates
-                        if full_url not in pr_urls:
-                            pr_urls.append(full_url)
+                        # Clean URL (remove fragments and query params for consistency)
+                        clean_url = full_url.split('#')[0].split('?')[0]
+
+                        # Validate URL format
+                        if self._is_valid_pr_url(clean_url, repo_url):
+                            pr_urls.append(clean_url)
+                            seen_pr_numbers.add(pr_number)
+
+                except Exception as e:
+                    logger.debug(f"Selector '{selector}' failed: {e}")
+                    continue
+
+            # Log extraction results for debugging
+            if pr_urls:
+                logger.debug(f"Extracted {len(pr_urls)} PR URLs using {len(selectors)} selectors")
+            else:
+                # Enhanced error reporting for parsing issues
+                logger.warning(f"No PR URLs found on page for {repo_url} - investigating parsing issue")
+                # Log detailed page structure for debugging
+                self._log_page_structure_debug(soup, repo_url)
 
             return pr_urls
 
         except Exception as e:
             logger.warning(f"Failed to extract PR URLs from page: {e}")
             return []
+
+    def _extract_pr_number_from_href(self, href: str) -> Optional[int]:
+        """Extract PR number from href for deduplication."""
+        try:
+            import re
+            match = re.search(r"/pull/(\d+)", href)
+            return int(match.group(1)) if match else None
+        except:
+            return None
+
+    def _is_valid_pr_url(self, url: str, repo_url: str) -> bool:
+        """Validate that the URL is a proper PR URL for this repository."""
+        try:
+            import re
+
+            # Extract repo path from repo_url
+            repo_match = re.search(r"github\.com/([^/]+/[^/]+)", repo_url)
+            if not repo_match:
+                return False
+
+            repo_path = repo_match.group(1)
+
+            # Check if URL matches the expected pattern
+            expected_pattern = f"https://github.com/{repo_path}/pull/\\d+"
+            return bool(re.match(expected_pattern, url))
+
+        except:
+            return False
+
+    def _log_page_structure_debug(self, soup, repo_url: str = None) -> None:
+        """Log page structure for debugging when no PRs are found."""
+        try:
+            # Check if this is actually a PR listing page
+            page_title = soup.find("title")
+            title_text = page_title.get_text() if page_title else "No title"
+
+            # Look for common GitHub elements
+            pr_elements = soup.select("a[href*='/pull/']")
+            issue_elements = soup.select("a[href*='/issues/']")
+
+            logger.debug(f"Page debug info for {repo_url or 'unknown repo'}:")
+            logger.debug(f"  Title: {title_text[:100]}")
+            logger.debug(f"  Total /pull/ links found: {len(pr_elements)}")
+            logger.debug(f"  Total /issues/ links found: {len(issue_elements)}")
+
+            # Sample some href values for analysis
+            if pr_elements:
+                sample_hrefs = [elem.get("href", "") for elem in pr_elements[:5]]
+                logger.debug(f"  Sample PR hrefs: {sample_hrefs}")
+
+                # Check if these are for the correct repository
+                if repo_url:
+                    import re
+                    repo_match = re.search(r"github\.com/([^/]+/[^/]+)", repo_url)
+                    if repo_match:
+                        expected_repo = repo_match.group(1)
+                        matching_hrefs = [href for href in sample_hrefs if expected_repo in href]
+                        logger.debug(f"  Matching repo hrefs: {len(matching_hrefs)}/{len(sample_hrefs)}")
+            else:
+                # No PR links found - check for common issues
+                logger.debug("  No PR links found - checking for common issues:")
+
+                # Check for rate limiting
+                rate_limit_indicators = soup.select("div:contains('rate limit'), span:contains('rate limit')")
+                if rate_limit_indicators:
+                    logger.debug("  ⚠️  Possible rate limiting detected")
+
+                # Check for empty state
+                empty_indicators = soup.select("div:contains('No results'), div:contains('no pull requests')")
+                if empty_indicators:
+                    logger.debug("  ℹ️  Empty state detected - no PRs available")
+
+                # Check for login requirement
+                login_indicators = soup.select("a[href*='login'], button:contains('Sign in')")
+                if login_indicators:
+                    logger.debug("  🔒 Login requirement detected")
+
+        except Exception as e:
+            logger.debug(f"Debug logging failed: {e}")
 
     def _get_pr_urls(self, repo_url: str, limit: int) -> List[str]:
         """Legacy method - kept for backward compatibility."""
@@ -640,51 +771,16 @@ class PullRequestScraper:
     def _extract_related_issue_ids(self, soup: BeautifulSoup) -> List[int]:
         """Extract related issue numbers mentioned in PR comments and description."""
         try:
-            related_issues = []
+            # Use the improved issue extractor
+            from .issue_validator import ImprovedIssueExtractor
+            extractor = ImprovedIssueExtractor()
 
-            # Look for issue references in PR description and comments
-            # Focus on actual issue links and keywords that indicate issues, not PRs
+            # Extract issue numbers using improved patterns
+            related_issues = extractor.extract_from_soup(soup)
 
-            # 1. Find direct issue links in href attributes
-            issue_links = soup.find_all('a', href=re.compile(r'/issues/(\d+)'))
-            for link in issue_links:
-                href = link.get('href', '')
-                match = re.search(r'/issues/(\d+)', href)
-                if match:
-                    issue_num = int(match.group(1))
-                    if issue_num not in related_issues:
-                        related_issues.append(issue_num)
-
-            # 2. Look for issue references with specific keywords (not just any #number)
-            text_content = soup.get_text()
-
-            # Only match #numbers that are clearly referring to issues, not PRs
-            issue_keywords_patterns = [
-                r"(?:fixes?|closes?|resolves?|addresses?)\s+#(\d+)",
-                r"(?:fix|close|resolve|address)\s+#(\d+)",
-                r"(?:issue|bug)\s+#(\d+)",
-                r"(?:see|related to|duplicate of)\s+(?:issue\s+)?#(\d+)",
-            ]
-
-            for pattern in issue_keywords_patterns:
-                matches = re.findall(pattern, text_content, re.IGNORECASE)
-                for match in matches:
-                    issue_num = int(match)
-                    if issue_num not in related_issues:
-                        related_issues.append(issue_num)
-
-            # 3. Look for issue references in comment text (more targeted)
-            comments = soup.find_all('div', class_=re.compile(r'comment-body'))
-            for comment in comments:
-                comment_text = comment.get_text()
-                # Only look for explicit issue references in comments
-                issue_refs = re.findall(r"(?:issue|bug|problem)\s+#(\d+)", comment_text, re.IGNORECASE)
-                for issue_ref in issue_refs:
-                    issue_num = int(issue_ref)
-                    if issue_num not in related_issues:
-                        related_issues.append(issue_num)
-
+            logger.debug(f"Extracted {len(related_issues)} potential issue references")
             return related_issues[:5]  # Limit to first 5 related issues
+
         except Exception as e:
             logger.warning(f"Error extracting related issue IDs: {e}")
             return []
@@ -701,25 +797,25 @@ class PullRequestScraper:
             pr_url_clean = pr_url.split('#')[0].split('?')[0]  # Remove fragments and query params
             pr_number = int(pr_url_clean.split("/")[-1])
 
+            # Filter out the current PR number
+            filtered_issue_ids = [issue_id for issue_id in issue_ids if issue_id != pr_number]
+
+            # Use validator to deduplicate and validate issue numbers
+            valid_issue_ids = self.validator.deduplicate_issue_list(repo_url, filtered_issue_ids)
+
+            if not valid_issue_ids:
+                logger.debug(f"No valid issues to scrape for PR {pr_url}")
+                return []
+
+            logger.debug(f"Scraping {len(valid_issue_ids)} related issues for PR {pr_url}")
+
             related_issues = []
-            for issue_id in issue_ids:
-                # Skip if this is the same number as the current PR
-                if issue_id == pr_number:
-                    logger.debug(f"Skipping issue #{issue_id} as it's the current PR number")
-                    continue
-
-                # Skip very high numbers that are likely PR numbers (issues are usually lower)
-                if issue_id > 50000:  # Reasonable threshold for most repositories
-                    logger.debug(f"Skipping issue #{issue_id} as it's likely a PR number (too high)")
-                    continue
-
+            for issue_id in valid_issue_ids:
                 logger.debug(f"Scraping related issue #{issue_id} for PR {pr_url}")
                 issue_info = self.issue_scraper.scrape_issue(repo_url, issue_id)
                 if issue_info:
                     related_issues.append(issue_info)
                     logger.debug(f"Successfully scraped related issue #{issue_id}")
-                else:
-                    logger.debug(f"Issue #{issue_id} not found (may not exist or may be a PR)")
 
             return related_issues
         except Exception as e:

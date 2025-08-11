@@ -11,15 +11,17 @@ from .models import PullRequestInfo
 from .pr_scraper import PullRequestScraper
 from .pr_checkpoint_manager import PRCheckpointManager, PRCrawlState
 from .pr_cache_manager import PRCacheManager
-from .config import MAX_CLOSED_PRS_TO_CRAWL, CRAWL_OPEN_PRS, CRAWL_CLOSED_PRS, REPOSITORY_PR_LIMITS
+from .config import MAX_CLOSED_PRS_TO_CRAWL, CRAWL_OPEN_PRS, CRAWL_CLOSED_PRS, REPOSITORY_PR_LIMITS, DISCOVERY_WORKERS, BATCH_SIZE, ENABLE_PROXY_REFRESH
+from .failed_issue_cache import FailedIssueCache
+from .issue_validator import IssueValidator
 
 
 class AggressivePRScraper:
     """Aggressive parallel PR scraper optimized for dynamic proxy systems."""
 
-    def __init__(self, max_workers: int = 20, discovery_workers: int = 10, cache_manager=None):
+    def __init__(self, max_workers: int = 20, discovery_workers: int = None, cache_manager=None):
         self.max_workers = max_workers
-        self.discovery_workers = discovery_workers
+        self.discovery_workers = discovery_workers or DISCOVERY_WORKERS  # Use config default
 
         # Use unified cache manager if provided, otherwise fall back to legacy managers
         if cache_manager:
@@ -31,15 +33,31 @@ class AggressivePRScraper:
             self.checkpoint_manager = PRCheckpointManager()
             self.cache_manager = PRCacheManager()
 
-        # Create multiple HTTP clients for parallel processing
-        self.http_clients = [HTTPClient() for _ in range(max_workers)]
-        self.pr_scrapers = [PullRequestScraper(client) for client in self.http_clients]
+        # Create shared optimization components
+        self.failed_cache = FailedIssueCache()
+        self.validator = IssueValidator()
+
+        # Create multiple HTTP clients for parallel processing with tunnel proxy support
+        self.http_clients = [HTTPClient(enable_proxy_refresh=ENABLE_PROXY_REFRESH) for _ in range(max_workers)]
+        self.pr_scrapers = [PullRequestScraper(client, self.failed_cache, self.validator) for client in self.http_clients]
 
         # Thread-safe counters
         self.stats_lock = threading.Lock()
         self.discovered_count = 0
         self.scraped_count = 0
-        self.failed_count = 0
+
+    def get_optimization_stats(self, repo_url: str = None) -> dict:
+        """Get statistics about optimization effectiveness."""
+        stats = {
+            'failed_cache_stats': self.failed_cache.get_stats(),
+            'validator_stats': self.validator.get_stats(repo_url) if repo_url else {}
+        }
+
+        if repo_url:
+            stats['failed_issues_for_repo'] = self.failed_cache.get_failed_count(repo_url)
+            stats['repo_blocked'] = not self.failed_cache.should_attempt_repo(repo_url)
+
+        return stats
 
     def _save_state(self, state):
         """Save state using appropriate manager."""
@@ -61,10 +79,20 @@ class AggressivePRScraper:
                 if is_complete:
                     state.closed_pages_complete = True
 
-            # Add URLs to discovered list
+            # Add URLs to discovered list and count new ones
+            new_count = 0
+            existing_urls = set(state.discovered_pr_urls)
             for url in page_urls:
-                if url not in state.discovered_pr_urls:
+                if url not in existing_urls:
                     state.discovered_pr_urls.append(url)
+                    existing_urls.add(url)
+                    new_count += 1
+
+            # Update PR counts for this state
+            if pr_state == "open":
+                state.open_prs_found += new_count
+            else:
+                state.closed_prs_found += new_count
         else:
             self.checkpoint_manager.update_discovery_progress(state, pr_state, page_num, page_urls, is_complete)
 
@@ -273,18 +301,18 @@ class AggressivePRScraper:
             max_pages = 500  # Reasonable upper bound - most repos don't have 500 pages
             max_consecutive_empty = 3  # Stop after 3 consecutive empty pages
 
-            # NO SMART LIMIT - User wants at least 1000 PRs crawled without tricks
+            # Respect configured limits; no implicit 1000 hardcaps
             effective_limit = limit
 
             if effective_limit:
-                logger.info(f"🔍 AGGRESSIVE {pr_state} PR discovery from page {start_page} (limit: {effective_limit:,})")
+                logger.info(f"🔍 ROBUST {pr_state} PR discovery from page {start_page} (limit: {effective_limit:,})")
             else:
-                logger.info(f"🔍 AGGRESSIVE {pr_state} PR discovery from page {start_page} (no limit)")
+                logger.info(f"🔍 ROBUST {pr_state} PR discovery from page {start_page} (no limit)")
 
             limit = effective_limit
 
             # Use AGGRESSIVE workers for page discovery
-            with ThreadPoolExecutor(max_workers=15) as executor:
+            with ThreadPoolExecutor(max_workers=self.discovery_workers) as executor:
                 page = start_page
                 consecutive_empty = 0
                 consecutive_failures = 0
@@ -309,7 +337,7 @@ class AggressivePRScraper:
                     batch_size = max(1, 10 - consecutive_failures)  # Reduce batch size when rate limited
                     futures = []
 
-                    logger.info(f"🚀 AGGRESSIVE BATCH: Processing pages {page}-{page+batch_size-1} (found: {total_found:,})")
+                    logger.info(f"🚀 ROBUST BATCH: Processing pages {page}-{page+batch_size-1} (found: {total_found:,})")
 
                     for i in range(batch_size):
                         if page + i > max_pages:
@@ -424,37 +452,141 @@ class AggressivePRScraper:
                 state.closed_pages_complete = True
 
             self._save_state(state)
-            logger.info(f"✅ Completed {pr_state} PR discovery: {total_found:,} URLs found")
+            # Validate discovery results - use discovered URLs from state
+            discovered_urls = state.discovered_pr_urls if hasattr(state, 'discovered_pr_urls') else []
+            self._validate_discovery_results(state.repo_url, pr_state, discovered_urls, page - start_page)
+
+            logger.info(f"✅ Completed ROBUST {pr_state} PR discovery: {total_found:,} URLs found")
 
         except Exception as e:
             logger.error(f"Error in {pr_state} PR discovery: {e}")
             raise
 
     def _fetch_page_urls(self, repo_url: str, pr_state: str, page: int) -> List[str]:
-        """Fetch PR URLs from a single page."""
+        """Fetch PR URLs from a single page with robust error handling."""
         try:
             # Use a random HTTP client (each gets new proxy IP)
             client_idx = page % len(self.http_clients)
             client = self.http_clients[client_idx]
-            
+
+            # Construct URL with proper encoding
             pulls_url = f"{repo_url.rstrip('/')}/pulls?q=is%3Apr+is%3A{pr_state}&page={page}"
-            soup = client.get_soup(pulls_url)
-            
-            if not soup:
-                return []
-            
-            # Extract URLs using the existing method
-            scraper = self.pr_scrapers[client_idx]
-            urls = scraper._extract_pr_urls_from_page(soup, repo_url)
-            
-            if urls:
-                logger.debug(f"Page {page} ({pr_state}): {len(urls)} URLs")
-            
-            return urls
-            
-        except Exception as e:
-            logger.warning(f"Failed to fetch page {page} ({pr_state}): {e}")
+
+            # Add retry logic for critical pages
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    soup = client.get_soup(pulls_url)
+
+                    if not soup:
+                        if attempt < max_retries - 1:
+                            logger.debug(f"Page {page} ({pr_state}) failed, retrying... (attempt {attempt + 1})")
+                            time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                            continue
+                        else:
+                            logger.warning(f"Page {page} ({pr_state}) failed after {max_retries} attempts")
+                            return []
+
+                    # Extract URLs using the robust method
+                    scraper = self.pr_scrapers[client_idx]
+                    urls = scraper._extract_pr_urls_from_page(soup, repo_url)
+
+                    if urls:
+                        logger.debug(f"Page {page} ({pr_state}): {len(urls)} URLs found")
+                        return urls
+                    elif attempt < max_retries - 1:
+                        # If no URLs found, it might be a parsing issue, retry
+                        logger.debug(f"Page {page} ({pr_state}) returned 0 URLs, retrying... (attempt {attempt + 1})")
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    else:
+                        # No URLs found after all retries - might be end of pages
+                        logger.debug(f"Page {page} ({pr_state}): 0 URLs (end of pages or parsing issue)")
+                        return []
+
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.debug(f"Page {page} ({pr_state}) error: {e}, retrying... (attempt {attempt + 1})")
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    else:
+                        raise e
+
             return []
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch page {page} ({pr_state}) after all retries: {e}")
+            return []
+
+    def _validate_discovery_results(self, repo_url: str, pr_state: str, urls: List[str], pages_processed: int) -> None:
+        """Validate PR discovery results and log potential issues."""
+        try:
+            total_urls = len(urls)
+
+            # Basic validation
+            if total_urls == 0:
+                logger.warning(f"⚠️  No {pr_state} PRs found - this may indicate:")
+                logger.warning(f"   • Repository has no {pr_state} PRs")
+                logger.warning(f"   • GitHub page structure changed")
+                logger.warning(f"   • Network/parsing issues")
+                return
+
+            # Check for reasonable distribution
+            avg_per_page = total_urls / max(pages_processed, 1)
+
+            if avg_per_page < 5:
+                logger.warning(f"⚠️  Low PR density: {avg_per_page:.1f} PRs/page (expected: 25-30)")
+                logger.warning(f"   This suggests potential parsing issues")
+
+            # Validate URL format
+            invalid_urls = []
+            duplicate_numbers = set()
+            pr_numbers = []
+
+            for url in urls[:10]:  # Sample first 10 URLs
+                if not self._is_valid_pr_url_format(url, repo_url):
+                    invalid_urls.append(url)
+
+                # Extract PR number
+                import re
+                match = re.search(r"/pull/(\d+)", url)
+                if match:
+                    pr_num = int(match.group(1))
+                    if pr_num in pr_numbers:
+                        duplicate_numbers.add(pr_num)
+                    pr_numbers.append(pr_num)
+
+            if invalid_urls:
+                logger.warning(f"⚠️  Found {len(invalid_urls)} invalid URLs (sample): {invalid_urls[:3]}")
+
+            if duplicate_numbers:
+                logger.warning(f"⚠️  Found duplicate PR numbers: {list(duplicate_numbers)[:5]}")
+
+            # Success metrics
+            if avg_per_page >= 20 and not invalid_urls:
+                logger.info(f"✅ Discovery validation passed: {total_urls} {pr_state} PRs, {avg_per_page:.1f} PRs/page")
+
+        except Exception as e:
+            logger.debug(f"Validation failed: {e}")
+
+    def _is_valid_pr_url_format(self, url: str, repo_url: str) -> bool:
+        """Check if URL has valid PR format."""
+        try:
+            import re
+
+            # Extract repo path
+            repo_match = re.search(r"github\.com/([^/]+/[^/]+)", repo_url)
+            if not repo_match:
+                return False
+
+            repo_path = repo_match.group(1)
+
+            # Check URL format
+            pattern = f"https://github.com/{re.escape(repo_path)}/pull/\\d+"
+            return bool(re.match(pattern, url))
+
+        except:
+            return False
 
     def _scrape_prs_aggressively(self, state: PRCrawlState, cached_pr_numbers: Set[int]) -> None:
         """Scrape PRs with maximum parallelism."""
@@ -478,8 +610,8 @@ class AggressivePRScraper:
                 logger.info("✅ All PRs already scraped!")
                 return
             
-            # Process in parallel batches
-            batch_size = self.max_workers * 2
+            # Process in parallel batches with optimized batch size
+            batch_size = max(BATCH_SIZE, self.max_workers * 2)  # Use config or calculated batch size
             scraped_count = 0
             
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:

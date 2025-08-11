@@ -10,38 +10,66 @@ from loguru import logger
 
 from .http_client import HTTPClient
 from .models import IssueInfo, Comment
+from .failed_issue_cache import FailedIssueCache
+from .issue_validator import IssueValidator
 
 
 class IssueScraper:
     """Scraper for detailed issue information including complete chat history."""
 
-    def __init__(self, http_client: HTTPClient):
+    def __init__(self, http_client: HTTPClient, failed_cache: FailedIssueCache = None, validator: IssueValidator = None):
         self.client = http_client
+        self.failed_cache = failed_cache or FailedIssueCache()
+        self.validator = validator or IssueValidator()
 
     def scrape_issue(self, repo_url: str, issue_number: int) -> Optional[IssueInfo]:
         """Scrape complete information for a single issue.
-        
+
         Args:
             repo_url: Repository URL (e.g., https://github.com/owner/repo)
             issue_number: Issue number to scrape
-            
+
         Returns:
             IssueInfo object with complete issue content or None if failed
         """
         try:
+            # Check if this issue has already failed
+            if self.failed_cache.is_failed(repo_url, issue_number):
+                logger.debug(f"Skipping issue #{issue_number} - previously failed")
+                return None
+
+            # Check if repository is blocked by circuit breaker
+            if not self.failed_cache.should_attempt_repo(repo_url):
+                logger.debug(f"Skipping issue #{issue_number} - repository blocked by circuit breaker")
+                return None
+
+            # Validate issue number
+            if not self.validator.validate_issue_number(repo_url, issue_number):
+                logger.debug(f"Skipping issue #{issue_number} - failed validation")
+                return None
+
+            # Mark as being processed
+            self.validator.mark_processing(repo_url, issue_number)
+
             # Construct issue URL
             issue_url = f"{repo_url.rstrip('/')}/issues/{issue_number}"
             logger.debug(f"Scraping issue: {issue_url}")
 
             soup = self.client.get_soup(issue_url)
             if not soup:
-                logger.warning(f"Failed to get soup for issue {issue_url}")
+                logger.debug(f"Failed to get soup for issue {issue_url}")
+                # Mark as failed and completed
+                self.failed_cache.mark_failed(repo_url, issue_number)
+                self.validator.mark_completed(repo_url, issue_number, success=False)
                 return None
 
             # Extract basic issue information
             title = self._extract_title(soup)
             if not title:
-                logger.warning(f"Could not extract title for issue {issue_number}")
+                logger.debug(f"Could not extract title for issue {issue_number}")
+                # Mark as failed and completed
+                self.failed_cache.mark_failed(repo_url, issue_number)
+                self.validator.mark_completed(repo_url, issue_number, success=False)
                 return None
 
             state = self._extract_state(soup)
@@ -49,7 +77,7 @@ class IssueScraper:
             created_at = self._extract_created_at(soup)
             updated_at = self._extract_updated_at(soup)
             tags = self._extract_tags(soup)
-            
+
             # Extract complete comment history
             comments = self._extract_comments(soup)
 
@@ -65,11 +93,18 @@ class IssueScraper:
                 url=issue_url,
             )
 
+            # Mark as successfully completed
+            self.validator.mark_completed(repo_url, issue_number, success=True)
+            self.failed_cache.mark_success(repo_url)
+
             logger.debug(f"Successfully scraped issue #{issue_number}")
             return issue_info
 
         except Exception as e:
             logger.error(f"Error scraping issue {issue_number}: {e}")
+            # Mark as failed and completed
+            self.failed_cache.mark_failed(repo_url, issue_number)
+            self.validator.mark_completed(repo_url, issue_number, success=False)
             return None
 
     def _extract_title(self, soup: BeautifulSoup) -> str:

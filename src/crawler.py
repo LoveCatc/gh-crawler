@@ -11,7 +11,7 @@ from .http_client import HTTPClient
 from .repository_scraper import RepositoryScraper
 from .aggressive_pr_scraper import AggressivePRScraper
 from .config import MAX_CLOSED_PRS_TO_CRAWL, CRAWL_CLOSED_PRS, CRAWL_OPEN_PRS, MIN_PRS_REQUIRED
-from .config import MAX_WORKERS
+from .config import MAX_WORKERS, ENABLE_PROXY_REFRESH
 from .checkpoint_manager import CheckpointManager
 from .io_handler import OutputHandler
 
@@ -115,16 +115,18 @@ class GitHubCrawler:
         try:
             logger.debug(f"Starting crawl for: {repo.url}")
             
-            with HTTPClient() as client:
+            with HTTPClient(enable_proxy_refresh=ENABLE_PROXY_REFRESH) as client:
                 # Initialize scrapers
                 repo_scraper = RepositoryScraper(client)
                 
                 # Scrape repository statistics
                 stats = repo_scraper.scrape_repository_stats(repo.url)
                 if not stats:
+                    # Use detailed error message if available
+                    error_msg = getattr(repo_scraper, 'last_error', None) or "Failed to scrape repository statistics"
                     return CrawlResult(
                         success=False,
-                        error="Failed to scrape repository statistics"
+                        error=error_msg
                     )
                 
                 # Check if PR crawling is enabled
@@ -133,9 +135,10 @@ class GitHubCrawler:
                     pull_requests = []
                 else:
                     # Use AGGRESSIVE PR scraping with focus on latest closed PRs
-                    total_prs = stats.total_pull_requests if stats else 1000
-                    open_prs = stats.open_pull_requests if stats else 50
-                    closed_prs = total_prs - open_prs if stats else 950
+                    from .config import MAX_PRS_FALLBACK
+                    total_prs = stats.total_pull_requests if stats else MAX_PRS_FALLBACK
+                    open_prs = stats.open_pull_requests if stats else int(MAX_PRS_FALLBACK * 0.05)
+                    closed_prs = total_prs - open_prs if stats else int(MAX_PRS_FALLBACK * 0.95)
                     expected_to_crawl = min(closed_prs, MAX_CLOSED_PRS_TO_CRAWL) if CRAWL_CLOSED_PRS else 0
 
                     logger.info(f"🚀 Starting AGGRESSIVE PR crawling for {repo.url}")
@@ -155,7 +158,7 @@ class GitHubCrawler:
                         logger.info("Strategy: No PRs will be crawled (both open and closed disabled)")
 
                     # Initialize aggressive scraper
-                    aggressive_scraper = AggressivePRScraper(max_workers=20, discovery_workers=10)
+                    aggressive_scraper = AggressivePRScraper(max_workers=self.max_workers, discovery_workers=max(4, self.max_workers // 2))
                     pull_requests = aggressive_scraper.scrape_all_prs_aggressively(
                         repo.url,
                         expected_to_crawl,  # Expected closed PRs to crawl
@@ -188,15 +191,15 @@ class GitHubCrawler:
     def _meets_minimum_pr_requirement(self, repository: CrawledRepository) -> bool:
         """Check if repository meets the minimum PR requirement.
 
-        The requirement is to crawl min(1000, num_all_closed_PRs) closed PRs.
-        This means we should crawl ALL closed PRs if there are fewer than 1000.
+        The requirement is to crawl min(MIN_PRS_REQUIRED, num_all_closed_PRs) closed PRs.
+        This means we should crawl ALL closed PRs if there are fewer than MIN_PRS_REQUIRED.
 
         The repository should be dropped if it has fewer PRs than this minimum requirement.
         """
 
         closed_prs_scraped = len([pr for pr in repository.pull_requests if pr.state in ['closed', 'merged']])
 
-        # The target is min(1000, actual_closed_PRs_in_repo)
+        # The target is min(MIN_PRS_REQUIRED, actual_closed_PRs_in_repo)
         target_closed_prs = min(MIN_PRS_REQUIRED, repository.stats.closed_pull_requests)
 
         # We should have scraped at least 90% of the target (allowing for some failed scrapes)
@@ -284,7 +287,7 @@ class GitHubCrawler:
                 additional_prs = aggressive_scraper.scrape_all_prs_aggressively(
                     repo.url,
                     working_repository.stats.total_pull_requests,
-                    max_closed_prs=additional_limit
+                    max_closed_prs=min(additional_limit, MAX_CLOSED_PRS_TO_CRAWL if CRAWL_CLOSED_PRS else 0)
                 )
 
                 # Merge with existing PRs (avoid duplicates)

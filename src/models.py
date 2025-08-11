@@ -88,6 +88,8 @@ class RepositoryStats:
     total_pull_requests: int = 0
     open_pull_requests: int = 0
     closed_pull_requests: int = 0
+    # Indicates whether PR counts were actually fetched (True) or are unknown (False)
+    pr_counts_available: bool = False
 
 
 @dataclass_json

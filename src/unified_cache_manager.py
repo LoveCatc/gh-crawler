@@ -8,7 +8,7 @@ from dataclasses import dataclass, asdict
 from loguru import logger
 
 from .models import PullRequestInfo
-from .config import CACHE_DIR, CACHE_PR_SUBDIR, CACHE_CHECKPOINT_SUBDIR, CACHE_COMMITS_SUBDIR
+from .config import CACHE_DIR, CACHE_PR_SUBDIR, CACHE_CHECKPOINT_SUBDIR, CACHE_COMMITS_SUBDIR, CACHE_FLUSH_BATCH_SIZE, CACHE_FLUSH_INTERVAL
 
 
 @dataclass
@@ -69,11 +69,12 @@ class UnifiedCacheManager:
         self.checkpoint_cache_dir.mkdir(exist_ok=True)
         self.commits_cache_dir.mkdir(exist_ok=True)
         
-        # Thread safety for PR caching
+        # Thread safety for PR caching with optimized batch sizes
         self.write_lock = threading.Lock()
         self.write_queue = []
-        self.batch_size = 10
-        
+        self.batch_size = CACHE_FLUSH_BATCH_SIZE  # Increased from 10 to 20
+        self.flush_interval = CACHE_FLUSH_INTERVAL  # Reduced from 30 to 15 seconds
+
         # Start background writer thread
         self.writer_thread = threading.Thread(target=self._background_writer, daemon=True)
         self.writer_thread.start()
@@ -162,11 +163,16 @@ class UnifiedCacheManager:
         except Exception as e:
             logger.error(f"Failed to queue PR for caching: {e}")
     
+    def flush_cache(self) -> None:
+        """Manually flush the write queue to disk (thread-safe public method)."""
+        with self.write_lock:
+            self._flush_queue()
+
     def _flush_queue(self) -> None:
         """Flush the write queue to disk."""
         if not self.write_queue:
             return
-            
+
         try:
             # Group by repository
             repo_prs = {}
@@ -174,25 +180,25 @@ class UnifiedCacheManager:
                 if repo_url not in repo_prs:
                     repo_prs[repo_url] = []
                 repo_prs[repo_url].append(pr_info)
-            
+
             # Write to files
             for repo_url, prs in repo_prs.items():
                 cache_file = self.get_pr_cache_file(repo_url)
-                
+
                 with open(cache_file, 'a', encoding='utf-8') as f:
                     for pr in prs:
                         pr_dict = pr.to_dict()
                         f.write(json.dumps(pr_dict, ensure_ascii=False) + '\n')
-                
+
                 logger.debug(f"Cached {len(prs)} PRs for {repo_url}")
-            
+
             # Clear queue
             total_written = len(self.write_queue)
             self.write_queue.clear()
-            
+
             if total_written > 0:
                 logger.info(f"Flushed {total_written} PRs to cache")
-                
+
         except Exception as e:
             logger.error(f"Error flushing PR cache queue: {e}")
     
@@ -201,7 +207,7 @@ class UnifiedCacheManager:
         import time
         while True:
             try:
-                time.sleep(30)  # Flush every 30 seconds
+                time.sleep(self.flush_interval)  # Configurable flush interval
                 with self.write_lock:
                     self._flush_queue()
             except Exception as e:
@@ -212,6 +218,12 @@ class UnifiedCacheManager:
         try:
             cache_file = self.get_pr_cache_file(repo_url)
             if not cache_file.exists():
+                # Track cache miss
+                try:
+                    from .performance_monitor import get_performance_monitor
+                    get_performance_monitor().increment_cache_misses()
+                except ImportError:
+                    pass
                 return []
             
             prs = []
@@ -228,6 +240,14 @@ class UnifiedCacheManager:
                             continue
             
             logger.info(f"Loaded {len(prs)} cached PRs for {repo_url}")
+
+            # Track cache hit
+            try:
+                from .performance_monitor import get_performance_monitor
+                get_performance_monitor().increment_cache_hits(len(prs))
+            except ImportError:
+                pass
+
             return prs
             
         except Exception as e:
